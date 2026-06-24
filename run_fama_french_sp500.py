@@ -11,15 +11,31 @@ Fama-French factor replication on the S&P 500
         - implemented data pipeline for:
             - DGS1MO
             - point-in-time S&P tickers
+        - implemented function for building and saving cache files
+            - prices
+            - book value data
+    Issues so far:
+        dropping 139-140 tickers on prices (delisted/acquired)
+        and 19 on fundamental section
+            - introduces survivorship bias
+        also only recent 3-4 years of book value and share count data available
+    
     Things to do next:
-        - implement functions to cache prices and book value data
         - evaluate Fama-French factors by dividing the investable universe
         - plan is to implement monthly rebalancing
+        - find a way to include delisted tickers
+        - also find a way to extract book value older than 4 years
+            (probably need a different data source)
+        (last 2 will only be implemented if an open source data source is discovered)
 """
 
 import os
+import time
+import logging
 import pandas as pd
+import yfinance as yf
 from pathlib import Path
+
 
 #####################
 # 0. Global Setup
@@ -45,13 +61,17 @@ CACHE_DIR = PROJECT_ROOT / 'factor-cache'
 os.makedirs(CACHE_DIR, exist_ok = True)
 
 START_YEAR = 2015
+START_DATE = '01-01'
 END_YEAR = 2025
+END_DATE = '12-31'
 
 # setup paths
 DGS1MO_PATH = DATA_DIR / 'DGS1MO.csv'
 PRICE_CACHE_PATH = CACHE_DIR / f'sp500_prices_{START_YEAR}_{END_YEAR}.parquet'
 FUNDAMENTALS_CACHE_PATH = CACHE_DIR / f'sp500_fundamentals_{START_YEAR}_{END_YEAR}.parquet'
 
+# suppress noisy yfinance warniings (e.g., delisted tickers)
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 #####################
 # 1. Data Pipeline
@@ -104,7 +124,7 @@ def get_point_in_time_universe_data() -> pd.DataFrame:
     Inputs:
         None
     Returns:
-        pd.DataFrmae:
+        pd.DataFrame:
     """
     
     url = 'https://raw.githubusercontent.com/fja05680/sp500/master/S%26P%20500%20Historical%20Components%20%26%20Changes%20(Updated).csv'
@@ -161,9 +181,9 @@ def get_all_historical_tickers(df_changes: pd.DataFrame,
         list -> complete sorted list of unique corporate tickers
     """
     # starting at beginning of year
-    start_date = pd.to_datetime(f'{start_year}-01-01')
+    start_date = pd.to_datetime(f'{start_year}-{START_DATE}')
     # ending at end of year
-    end_date = pd.to_datetime(f'{end_year}-12-31')
+    end_date = pd.to_datetime(f'{end_year}-{END_DATE}')
     
     # declare empty set
     all_tickers = set()
@@ -185,9 +205,133 @@ def get_all_historical_tickers(df_changes: pd.DataFrame,
         for ticker in tickers_string.replace('.','-').split(','):
             all_tickers.add(ticker.strip())
     
-    
     return sorted(list(all_tickers))
 
 
+#####################
+# 2. Data Caching
+#####################
 
+def build_and_cache_data(start_year: int, end_year: int,
+                         force_redownload: bool = False,
+                         verbose = False):
+    """
+    Constructs local parquet cache files for stock prices and fundamentals
+    by querying Yahoo Finance API. Throttled requests to not hit rate limits.
+
+    Inputs:
+        start_year (int): Starting year for data downloads
+        end_year (int): Ending year for data download
+        force_redownload (bool): toggle to overwrite existing local cache files
+        verbose (bool): toggle to whether or not show progress
+
+    Returns:
+        None (saves data structures directly onto cache files)
+
+    """
+    # point-in-time S&P 500 index changes tracking log
+    df_changes = get_point_in_time_universe_data()
+    # relevant stocks for the time window
+    all_tickers = get_all_historical_tickers(df_changes, start_year, end_year)
     
+    start_str = f'{start_year}-{START_DATE}'
+    end_str = f'{end_year}-{END_DATE}'
+    
+    ## Price caching
+    if not PRICE_CACHE_PATH.exists() or force_redownload:
+        if verbose:    
+            print(f'Downloading historical daily prices'
+                  f'for {len(all_tickers)} tickers...')
+        raw_prices = yf.download(all_tickers,
+                                 start = start_str,
+                                 end = end_str,
+                                 auto_adjust = True, progress = False
+                                 )['Close']
+        # drop tickers that are completely empty
+        raw_prices = raw_prices.dropna(axis = 1, how = 'all')
+        raw_prices.to_parquet(PRICE_CACHE_PATH)
+        
+        if verbose:
+            # for debugging
+            if isinstance(raw_prices.columns, pd.MultiIndex):
+                active_price_tickers = list(raw_prices.columns.get_level_values(-1).unique())
+            else:
+                active_price_tickers = list(raw_prices.columns)
+            dropped_price_total = len(all_tickers) - len(active_price_tickers)
+            
+            print(f'Total tickers before pricing section: {len(all_tickers)}')
+            print(f'Tickers dropped by yfinance (pricing): {dropped_price_total}')
+        
+    else:
+        if verbose:
+            print('Price cache validated locally. Proceeding.')
+    
+        
+    ## Fundamentals Caching
+    if not FUNDAMENTALS_CACHE_PATH.exists() or force_redownload:
+        if verbose:
+            print('Extracting annual balance sheet values (throttled loop)...')
+        
+        fundamental_records = []
+        skipped_tickers = []        # for debugging
+        
+        for i, ticker in enumerate(active_price_tickers):
+            if i % 20 == 0 and i > 0:
+                time.sleep(0.1)    # added delay to avoid rate limits
+            
+            try:
+                ticker_obj = yf.Ticker(ticker)
+                bs = ticker_obj.balance_sheet
+                
+                # variations of string names for equity and number of shares
+                equity_labels = ['Stockholders Equity',
+                                 'Total Stockholders Equity',
+                                 'Common Stock Equity']
+                shares_labels = ['Ordinary Shares Number',
+                                 'Shares Outstanding',
+                                 'Implied Shares Outstanding']
+                
+                equity_row = next((bs.loc[label] for label in equity_labels if label in bs.index), None)
+                shares_row = next((bs.loc[label] for label in shares_labels if label in bs.index), None)
+                
+                if equity_row is not None and shares_row is not None:
+                    for date_index in bs.columns:
+                        fundamental_records.append({
+                            'ticker': ticker,
+                            'filing_date': pd.to_datetime(date_index),
+                            'book_value': float(equity_row[date_index]),
+                            'shares_outstanding': float(shares_row[date_index])
+                            })
+                else:
+                    skipped_tickers.append(ticker)
+                
+            except Exception as e:
+                skipped_tickers.append(ticker)
+                # for debugging
+                if verbose:    
+                    print(f'Failed parsing fundamentals for {ticker}: {str(e)}')
+                continue
+        
+        df_fund = pd.DataFrame(fundamental_records)
+        df_fund.to_parquet(FUNDAMENTALS_CACHE_PATH)
+        if verbose:
+            print('Fundamentals downloaded and stored to local Parquet cache.\n'
+                  f'Successfully parsed {len(df_fund["ticker"].unique())} stocks')
+            print(f'Skipped {len(skipped_tickers)} tickers (on fundamentals portion)')
+    
+    else:
+        if verbose:
+            print('Fundamentals cache validated locally. Proceeding.')
+
+    return None
+
+
+#####################
+# -1. Execution
+#####################
+if __name__ == '__main__':
+    # testing for debugging
+        build_and_cache_data(start_year = START_YEAR,
+                         end_year = END_YEAR,
+                         force_redownload = True,
+                         verbose = True)
