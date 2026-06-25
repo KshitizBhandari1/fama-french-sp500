@@ -14,15 +14,15 @@ Fama-French factor replication on the S&P 500
         - implemented function for building and saving cache files
             - prices
             - book value data
+        - implemented evaluation of Fama-French factors
+            - by dividing the investable universe into 6 core portfolios
     Issues so far:
         dropping 139-140 tickers on prices (delisted/acquired)
         and 19 on fundamental section
             - introduces survivorship bias
         also only recent 3-4 years of book value and share count data available
-    
+            - as a result, FF factors also only available since 2022-06-30
     Things to do next:
-        - evaluate Fama-French factors by dividing the investable universe
-        - plan is to implement monthly rebalancing
         - find a way to include delisted tickers
         - also find a way to extract book value older than 4 years
             (probably need a different data source)
@@ -32,6 +32,7 @@ Fama-French factor replication on the S&P 500
 import os
 import time
 import logging
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from pathlib import Path
@@ -77,7 +78,7 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 # 1. Data Pipeline
 #####################
 def load_dgs1mo_data(csv_path = DGS1MO_PATH):
-    """
+    """ 
     Loads DGS1MO (1M US Treasury Constant Maturity Rate) from a local csv,
     transforms annual yields into daily decimals, and forward-fills
     holidays.
@@ -97,10 +98,10 @@ def load_dgs1mo_data(csv_path = DGS1MO_PATH):
     # read csv file with two columns 'observation_date' and 'DGS1MO'
     df = pd.read_csv(csv_path, parse_dates = ['observation_date'])
     # standardize column layout
-    df = df.rename(columns = {'observation_date': 'date', 'DGS1MO': 'r_f'})
+    df = df.rename(columns = {'observation_date': 'date', 'DGS1MO': 'rf'})
     
     #ensure values are numeric
-    df['r_f'] = pd.to_numeric(df['r_f'], errors = 'coerce')
+    df['rf'] = pd.to_numeric(df['rf'], errors = 'coerce')
     # set date as index and sort
     df = df.set_index('date').sort_index()
     
@@ -111,10 +112,10 @@ def load_dgs1mo_data(csv_path = DGS1MO_PATH):
     df = df[df.index.dayofweek < 5]
     
     # geometric compounding for a year with TRADING_DAYS
-    df['r_f'] = (1 + (df['r_f']/100.0)) ** (1.0 / TRADING_DAYS) - 1.0
+    df['rf'] = (1 + (df['rf']/100.0)) ** (1.0 / TRADING_DAYS) - 1.0
     
     # return risk-free rate as series
-    return df['r_f']
+    return df['rf']
 
 
 def get_point_in_time_universe_data() -> pd.DataFrame:
@@ -237,7 +238,7 @@ def build_and_cache_data(start_year: int, end_year: int,
     start_str = f'{start_year}-{START_DATE}'
     end_str = f'{end_year}-{END_DATE}'
     
-    ## Price caching
+    ## === Price caching ===
     if not PRICE_CACHE_PATH.exists() or force_redownload:
         if verbose:    
             print(f'Downloading historical daily prices'
@@ -251,29 +252,29 @@ def build_and_cache_data(start_year: int, end_year: int,
         raw_prices = raw_prices.dropna(axis = 1, how = 'all')
         raw_prices.to_parquet(PRICE_CACHE_PATH)
         
-        if verbose:
-            # for debugging
-            if isinstance(raw_prices.columns, pd.MultiIndex):
-                active_price_tickers = list(raw_prices.columns.get_level_values(-1).unique())
-            else:
-                active_price_tickers = list(raw_prices.columns)
-            dropped_price_total = len(all_tickers) - len(active_price_tickers)
-            
-            print(f'Total tickers before pricing section: {len(all_tickers)}')
-            print(f'Tickers dropped by yfinance (pricing): {dropped_price_total}')
-        
     else:
         if verbose:
             print('Price cache validated locally. Proceeding.')
+        raw_prices = pd.read_parquet(PRICE_CACHE_PATH)
     
+    if isinstance(raw_prices.columns, pd.MultiIndex):
+        active_price_tickers = list(raw_prices.columns.get_level_values(-1).unique())
+    else:
+        active_price_tickers = list(raw_prices.columns)
         
-    ## Fundamentals Caching
+    if verbose:
+        # for debugging
+        dropped_price_total = len(all_tickers) - len(active_price_tickers)
+        
+        print(f'Total tickers before pricing section: {len(all_tickers)}')
+        print(f'Tickers dropped by yfinance (pricing): {dropped_price_total}')
+    
+    ## === Fundamentals Caching ===
     if not FUNDAMENTALS_CACHE_PATH.exists() or force_redownload:
         if verbose:
             print('Extracting annual balance sheet values (throttled loop)...')
         
         fundamental_records = []
-        skipped_tickers = []        # for debugging
         
         for i, ticker in enumerate(active_price_tickers):
             if i % 20 == 0 and i > 0:
@@ -302,36 +303,222 @@ def build_and_cache_data(start_year: int, end_year: int,
                             'book_value': float(equity_row[date_index]),
                             'shares_outstanding': float(shares_row[date_index])
                             })
-                else:
-                    skipped_tickers.append(ticker)
                 
             except Exception as e:
-                skipped_tickers.append(ticker)
-                # for debugging
                 if verbose:    
                     print(f'Failed parsing fundamentals for {ticker}: {str(e)}')
                 continue
         
         df_fund = pd.DataFrame(fundamental_records)
         df_fund.to_parquet(FUNDAMENTALS_CACHE_PATH)
+        
         if verbose:
-            print('Fundamentals downloaded and stored to local Parquet cache.\n'
-                  f'Successfully parsed {len(df_fund["ticker"].unique())} stocks')
-            print(f'Skipped {len(skipped_tickers)} tickers (on fundamentals portion)')
+            print('Fundamentals downloaded and stored to local Parquet cache.\n')
     
     else:
         if verbose:
             print('Fundamentals cache validated locally. Proceeding.')
+            df_fund = pd.read_parquet(FUNDAMENTALS_CACHE_PATH)
+    
+    if verbose:
+        successful_fundamental_tickers = set(df_fund['ticker'].unique())
+        skipped_tickers = [t for t in active_price_tickers if t not in successful_fundamental_tickers]
+        
+        print(f'Successfully parsed {len(successful_fundamental_tickers)} stocks')
+        print(f'Skipped {len(skipped_tickers)} tickers (on fundamentals portion)')
 
     return None
 
+
+#####################
+# 3. Fama-French factors
+#####################
+
+def run_fama_french(start_year: int,
+                    end_year: int) -> pd.DataFrame:
+    
+    # load foundational data structures and cache
+    df_changes = get_point_in_time_universe_data()    
+    price_matrix = pd.read_parquet(PRICE_CACHE_PATH)
+    df_fundamentals = pd.read_parquet(FUNDAMENTALS_CACHE_PATH)
+    rf_series = load_dgs1mo_data()
+    
+    # all active trading days
+    df_dates = pd.Series(price_matrix.index, index = price_matrix.index)
+    # extract actual last trading day for each month
+    month_end_dates = df_dates.resample('ME').max().values
+    
+    factor_results = []
+    
+    # iterate through rebalancing dates (month-end)
+    # len - 1 bound -> final available date is ultimate liquidation
+    # no new position can be formed at the last trading day
+    for month_index in range(len(month_end_dates) - 1):
+        rebalance_date = month_end_dates[month_index]
+        next_month_end = month_end_dates[month_index + 1]
+        
+        # investable universe active in the index on formation day
+        active_tickers = get_constituents_on_date(target_date = rebalance_date,
+                                                  df_changes = df_changes)
+        # active tickers with actual prices available
+        valid_tickers = [ticker for ticker in active_tickers if ticker in price_matrix.columns]
+        
+        if not valid_tickers:
+            logging.warning(f'No valid tickers to invest on {rebalance_date}')
+            continue
+        
+        # price trajectory for the upcoming month
+        # (starting from last trading day close this month) 
+        month_prices = price_matrix.loc[rebalance_date:next_month_end, valid_tickers]
+        if len(month_prices) < 2:
+            continue
+        
+        # Return calculation
+        # forward filled -> in case of delisting/acquisition (ensures 0% return post-event)
+        month_returns = month_prices.pct_change().ffill().dropna(how = 'all')
+        # cumulative 
+        cum_month_returns = (1 + month_returns).prod() - 1
+        
+        cross_section_data = []
+        
+        # construct fundamental financial metrics for all valid assets on the cross-sectional line
+        for ticker in valid_tickers:
+            # closing price on rebalancing day to caluclate size and ratios
+            close_price = price_matrix.loc[rebalance_date, ticker]
+            if pd.isna(close_price) or close_price <= 0:
+                continue
+            
+            # filter fundamental filings published strictly on or before rebalance date
+            # mimics real-world information availability and eliminates look-ahead bias
+            ticker_fundamentals = df_fundamentals[
+                (df_fundamentals['ticker'] == ticker) &
+                (df_fundamentals['filing_date'] <= rebalance_date)
+                ]
+            
+            if ticker_fundamentals.empty:
+                continue
+            
+            # isolate most recent financial statement available on this date
+            latest_filing = ticker_fundamentals.sort_values('filing_date').iloc[-1]
+            
+            # calcluate market cap using active price and latest known share count
+            market_cap = close_price * latest_filing['shares_outstanding']
+            
+            # book-to-market ratio
+            # high value -> value stocks, low value -> growth stocks
+            bm_ratio = latest_filing['book_value'] / market_cap
+            
+            # cumulative forward return for this ticker
+            forward_return = cum_month_returns.get(ticker, np.nan)
+            
+            # skip tickers with missing structural metrics to prevent NaNs
+            if pd.isna(forward_return) or pd.isna(bm_ratio) or market_cap <= 0:
+                continue
+            
+            cross_section_data.append({
+                'ticker': ticker,
+                'market_cap': market_cap,
+                'bm_ratio': bm_ratio,
+                'forward_return': forward_return
+                })
+            
+        df_cs = pd.DataFrame(cross_section_data)
+        
+        if df_cs.empty:
+            continue
+        
+        # === 2x3 Intersting Sort Matrices ===
+        
+        # size divided by cross-sectional median market cap
+        # Small portfolio elements < median, Big portfolio elements > median
+        size_median = df_cs['market_cap'].median()
+        
+        # break points for HML portfolios:
+        # top 30% (Value), middle 40% (Neutral), bottom 40% (Growth)
+        bm_30 = df_cs['bm_ratio'].quantile(0.30)
+        bm_70 = df_cs['bm_ratio'].quantile(0.70)
+        
+        # segement universe into Size and Value/Growth boolean masks
+        small_mask = df_cs['market_cap'] <= size_median
+        big_mask = df_cs['market_cap'] > size_median
+        
+        growth_mask = df_cs['bm_ratio'] <= bm_30
+        neutral_mask = (df_cs['bm_ratio'] > bm_30) & (df_cs['bm_ratio'] < bm_70)
+        value_mask = df_cs['bm_ratio'] >= bm_70
+        
+        # generate the 6 intersection portfolios (like Small-Growth, Big Growth, etc.)
+        portfolios = {
+            'SG': df_cs[small_mask & growth_mask],
+            'SN': df_cs[small_mask & neutral_mask],
+            'SV': df_cs[small_mask & value_mask],
+            'BG': df_cs[big_mask & growth_mask],
+            'BN': df_cs[big_mask & neutral_mask],
+            'BV': df_cs[big_mask & value_mask]
+            }
+        
+        # calculat evalue-weighted returns for each of 6 core portfolois
+        portfolio_returns = {}
+        for name, port_df in portfolios.items():
+            if port_df.empty:
+                portfolio_returns[name] = 0.0
+                continue
+            # market cap weights within this specific sub-portfolio
+            weights = port_df['market_cap'] / port_df['market_cap'].sum()
+            # dot product of weights and forward monthly returns
+            portfolio_returns[name] = np.dot(port_df['forward_return'], weights)
+        
+        # === Factor equations ===
+        
+        # SMB (Small Minus Big) -> size premium
+        # avg return of 3 small portfolios - avg return of 3 big portfolios
+        smb = ((portfolio_returns['SG'] + portfolio_returns['SN'] + portfolio_returns['SV']) / 3.0) - \
+              ((portfolio_returns['BG'] + portfolio_returns['BN'] + portfolio_returns['BV']) / 3.0)
+        
+        # HML (High Minus Low) -> value premium
+        hml = ((portfolio_returns['SV'] + portfolio_returns['BV']) / 2.0) - \
+              ((portfolio_returns['SG'] + portfolio_returns['BG']) / 2.0)
+    
+        # value-weighted broad market return across investable universe
+        total_market_cap = df_cs['market_cap'].sum()
+        market_weights = df_cs['market_cap'] / total_market_cap
+        market_raw_return = np.dot(df_cs['forward_return'], market_weights)
+        
+        # extract daily risk-free rates recorved over monthly investment horizon
+        rf_slice = rf_series.loc[rebalance_date:next_month_end]
+        # the 1-month risk-free rate -> used to subtract from market return to get the market risk premium factor
+        rf_monthly_cumulative = 0.0 if rf_slice.empty else float((1 + rf_slice).prod() - 1)
+        
+        # Market Excess Return (Mkt - RF)
+        market_excess = market_raw_return - rf_monthly_cumulative
+        
+        factor_results.append({
+            'month_end' : next_month_end,
+            'mkt-rf': market_excess,
+            'smb': smb,
+            'hml': hml,
+            'rf_decomp': rf_monthly_cumulative
+            })
+        
+    return pd.DataFrame(factor_results).set_index('month_end')
+    
 
 #####################
 # -1. Execution
 #####################
 if __name__ == '__main__':
     # testing for debugging
-        build_and_cache_data(start_year = START_YEAR,
-                         end_year = END_YEAR,
-                         force_redownload = True,
-                         verbose = True)
+    build_and_cache_data(start_year = START_YEAR,
+                     end_year = END_YEAR,
+                     force_redownload = True,
+                     verbose = True)
+    
+    print('\nBuilding proxy factors for S&P 500...')
+    ff_factors_df = run_fama_french(start_year = START_YEAR,
+                                    end_year = END_YEAR)
+    
+    print('\n=== Replicated S&P 500 FF factor proxies ===')
+    print(ff_factors_df.to_string())
+    
+    print('\n=== Correlation matrix ===')
+    print(ff_factors_df[['mkt-rf', 'smb', 'hml']].corr())
+    
