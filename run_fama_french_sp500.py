@@ -7,7 +7,7 @@ Created on Mon Jun 22 08:13:36 2026
 
 Fama-French factor replication on the S&P 500
     Done so far:
-        - establishhed global setup
+        - established global setup
         - implemented data pipeline for:
             - DGS1MO
             - point-in-time S&P tickers
@@ -49,7 +49,7 @@ TRADING_DAYS = 252
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # walk up until repo marker
-# assumes rep-root contains 'data/' directory
+# assumes repo-root contains 'data/' directory
 while not (PROJECT_ROOT / 'data').exists():
     if PROJECT_ROOT.parent == PROJECT_ROOT:
         raise FileNotFoundError('Could not find "data/" directory.'
@@ -71,7 +71,7 @@ DGS1MO_PATH = DATA_DIR / 'DGS1MO.csv'
 PRICE_CACHE_PATH = CACHE_DIR / f'sp500_prices_{START_YEAR}_{END_YEAR}.parquet'
 FUNDAMENTALS_CACHE_PATH = CACHE_DIR / f'sp500_fundamentals_{START_YEAR}_{END_YEAR}.parquet'
 
-# suppress noisy yfinance warniings (e.g., delisted tickers)
+# suppress noisy yfinance warnings (e.g., delisted tickers)
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 #####################
@@ -100,7 +100,7 @@ def load_dgs1mo_data(csv_path = DGS1MO_PATH):
     # standardize column layout
     df = df.rename(columns = {'observation_date': 'date', 'DGS1MO': 'rf'})
     
-    #ensure values are numeric
+    # ensure values are numeric
     df['rf'] = pd.to_numeric(df['rf'], errors = 'coerce')
     # set date as index and sort
     df = df.set_index('date').sort_index()
@@ -224,7 +224,7 @@ def build_and_cache_data(start_year: int, end_year: int,
         start_year (int): Starting year for data downloads
         end_year (int): Ending year for data download
         force_redownload (bool): toggle to overwrite existing local cache files
-        verbose (bool): toggle to whether or not show progress
+        verbose (bool): toggle to whether or not to show progress
 
     Returns:
         None (saves data structures directly onto cache files)
@@ -336,7 +336,26 @@ def build_and_cache_data(start_year: int, end_year: int,
 
 def run_fama_french(start_year: int,
                     end_year: int) -> pd.DataFrame:
+    """
+    Executes the Fama-French 3-factor replication mechanism.
     
+    Sorts the point-in-time investable universe into 2x3 value-weighted portfolios
+    based on Size (Market Cap) and Value/Growth (Book-to-Market ratio).
+    
+    Evaluates monthly factor returns (Mkt-RF, SMB, HML) using monthly rebalancing.
+    
+    Inputs:
+        start_year (int): starting year for the factor analysis window
+        end_year (int): ending year for the factor analysis window
+        
+    Returns:
+        pd.DataFrame: chronologically indexed DataFrame by last trading day
+        of the month consisting of columns:
+            - mkt-rf
+            - smb
+            - hml
+            - rf_decomp
+    """
     # load foundational data structures and cache
     df_changes = get_point_in_time_universe_data()    
     price_matrix = pd.read_parquet(PRICE_CACHE_PATH)
@@ -383,7 +402,7 @@ def run_fama_french(start_year: int,
         
         # construct fundamental financial metrics for all valid assets on the cross-sectional line
         for ticker in valid_tickers:
-            # closing price on rebalancing day to caluclate size and ratios
+            # closing price on rebalancing day to calculate size and ratios
             close_price = price_matrix.loc[rebalance_date, ticker]
             if pd.isna(close_price) or close_price <= 0:
                 continue
@@ -401,7 +420,7 @@ def run_fama_french(start_year: int,
             # isolate most recent financial statement available on this date
             latest_filing = ticker_fundamentals.sort_values('filing_date').iloc[-1]
             
-            # calcluate market cap using active price and latest known share count
+            # calculate market cap using active price and latest known share count
             market_cap = close_price * latest_filing['shares_outstanding']
             
             # book-to-market ratio
@@ -427,7 +446,7 @@ def run_fama_french(start_year: int,
         if df_cs.empty:
             continue
         
-        # === 2x3 Intersting Sort Matrices ===
+        # === 2x3 Cross-Categorized Sort Matrices ===
         
         # size divided by cross-sectional median market cap
         # Small portfolio elements < median, Big portfolio elements > median
@@ -438,7 +457,7 @@ def run_fama_french(start_year: int,
         bm_30 = df_cs['bm_ratio'].quantile(0.30)
         bm_70 = df_cs['bm_ratio'].quantile(0.70)
         
-        # segement universe into Size and Value/Growth boolean masks
+        # segment universe into Size and Value/Growth boolean masks
         small_mask = df_cs['market_cap'] <= size_median
         big_mask = df_cs['market_cap'] > size_median
         
@@ -456,7 +475,7 @@ def run_fama_french(start_year: int,
             'BV': df_cs[big_mask & value_mask]
             }
         
-        # calculat evalue-weighted returns for each of 6 core portfolois
+        # calculate value-weighted returns for each of 6 core portfolois
         portfolio_returns = {}
         for name, port_df in portfolios.items():
             if port_df.empty:
@@ -486,17 +505,17 @@ def run_fama_french(start_year: int,
         # extract daily risk-free rates recorved over monthly investment horizon
         rf_slice = rf_series.loc[rebalance_date:next_month_end]
         # the 1-month risk-free rate -> used to subtract from market return to get the market risk premium factor
-        rf_monthly_cumulative = 0.0 if rf_slice.empty else float((1 + rf_slice).prod() - 1)
+        rf_monthly = 0.0 if rf_slice.empty else float((1 + rf_slice).prod() - 1)
         
         # Market Excess Return (Mkt - RF)
-        market_excess = market_raw_return - rf_monthly_cumulative
+        market_excess = market_raw_return - rf_monthly
         
         factor_results.append({
             'month_end' : next_month_end,
             'mkt-rf': market_excess,
             'smb': smb,
             'hml': hml,
-            'rf_decomp': rf_monthly_cumulative
+            'rf_monthly': rf_monthly
             })
         
     return pd.DataFrame(factor_results).set_index('month_end')
