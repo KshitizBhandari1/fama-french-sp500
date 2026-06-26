@@ -16,22 +16,30 @@ Fama-French factor replication on the S&P 500
             - book value data
         - implemented evaluation of Fama-French factors
             - by dividing the investable universe into 6 core portfolios
+        - changed fundamentals data source from yfinance API to SEC EDGAR API
+            - can extract data from further back unlike yfinance's 3-4 years only
+
     Issues so far:
-        dropping 139-140 tickers on prices (delisted/acquired)
-        and 19 on fundamental section
+        dropping:
+            139-140 tickers on prices (delisted/acquired)
+            77 on fundamental section
             - introduces survivorship bias
-        also only recent 3-4 years of book value and share count data available
-            - as a result, FF factors also only available since 2022-06-30
+            
+        -> tried using alternative datasets (like stooq) for delisted tickers
+            -> still failed
+        -> cannot find an open source database yet
+            -> hence survivorship bias seems unavoidable without paid databases
+    
     Things to do next:
-        - find a way to include delisted tickers
-        - also find a way to extract book value older than 4 years
-            (probably need a different data source)
-        (last 2 will only be implemented if an open source data source is discovered)
+        - regress proxy factors against the actual Fama-French factors
+            Perfect correlation is not expected as S&P 500 is inherently a large-cap universe
+        
 """
 
 import os
 import time
 import logging
+import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -44,6 +52,9 @@ from pathlib import Path
 
 # trading days
 TRADING_DAYS = 252
+
+# Secure User-Agent identity required by SEC Edgar API
+SEC_HEADERS = {'User-Agent': 'YourName email@domain.com'}
 
 # initialize project root as directory containing this script
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -70,13 +81,44 @@ END_DATE = '12-31'
 DGS1MO_PATH = DATA_DIR / 'DGS1MO.csv'
 PRICE_CACHE_PATH = CACHE_DIR / f'sp500_prices_{START_YEAR}_{END_YEAR}.parquet'
 FUNDAMENTALS_CACHE_PATH = CACHE_DIR / f'sp500_fundamentals_{START_YEAR}_{END_YEAR}.parquet'
+UNIVERSE_CACHE_PATH = CACHE_DIR / f'sp500_index_changes_{START_YEAR}_{END_YEAR}.parquet'
 
 # suppress noisy yfinance warnings (e.g., delisted tickers)
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
+
+# === Global SEC CIK map initialization ===
+# previously was running a slow O(N) linear search loop for each ticker
+def download_sec_cik_map() -> dict:
+    """
+    Downloads the SEC's complete CIK (Central Index Key) matrix
+    Normalizes mixed-source ticker to remove punctuation
+    Returns 10-character (pre-padded) CIK hash table.
+    """
+    try:
+        url = 'https://www.sec.gov/files/company_tickers.json'
+        res = requests.get(url, headers = SEC_HEADERS, timeout = 10).json()
+        
+        # clean both sides of comparision to capture dual-class variations
+        # (BRK-B, AMH-PG, etc.) removing hypthens and dots
+        return {
+            row['ticker'].replace('-', '').replace('.','').upper():
+                str(row['cik_str']).zfill(10) # enforce 10 character string to be compatible with SEC
+                for row in res.values()
+                }
+    except Exception as e:
+        print(f'Warning: Failed to compile global SEC CIK map: {e}')
+        return {}
+
+# save the compiled dictionary once globally (reducing run-time)
+SEC_CIK_MAP = download_sec_cik_map()
+
+
+
 #####################
 # 1. Data Pipeline
 #####################
+
 def load_dgs1mo_data(csv_path = DGS1MO_PATH):
     """ 
     Loads DGS1MO (1M US Treasury Constant Maturity Rate) from a local csv,
@@ -129,8 +171,21 @@ def get_point_in_time_universe_data() -> pd.DataFrame:
     """
     
     url = 'https://raw.githubusercontent.com/fja05680/sp500/master/S%26P%20500%20Historical%20Components%20%26%20Changes%20(Updated).csv'
-    # parse using 'date' column in the file
-    df_changes = pd.read_csv(url, parse_dates = ['date'])
+      
+    if UNIVERSE_CACHE_PATH.exists():
+        file_age_days = (time.time() - UNIVERSE_CACHE_PATH.stat().st_mtime) / 86400
+        # implement 30-day window cache to bypass redundant network use
+        # user fja05680 highlights he updates the file every couple of months
+        if file_age_days < 30:
+            return pd.read_parquet(UNIVERSE_CACHE_PATH).sort_values('date')
+        
+    try:
+        # parse using 'date' column in the file
+        df_changes = pd.read_csv(url, parse_dates = ['date'])
+        df_changes.to_parquet(UNIVERSE_CACHE_PATH, index = False)
+    except Exception:
+        # localized recovery fallback if remote source is removed/moved
+        df_changes = pd.read_parquet(UNIVERSE_CACHE_PATH)
     
     return df_changes.sort_values('date')
 
@@ -171,7 +226,7 @@ def get_all_historical_tickers(df_changes: pd.DataFrame,
                                end_year: int) -> list:
     """
     Scans the point-in-time index histories across target date limits
-    outputs all stock tickers ever listed on the S&P 500 in that time window
+    Outputs all stock tickers ever listed on the S&P 500 in that time window
     
     Inputs:
         df_changes (pd.DataFrame): point-in-time historical adjustment log
@@ -181,12 +236,11 @@ def get_all_historical_tickers(df_changes: pd.DataFrame,
     Returns:
         list -> complete sorted list of unique corporate tickers
     """
-    # starting at beginning of year
+    # note: years are inputs but month/date is globalized
     start_date = pd.to_datetime(f'{start_year}-{START_DATE}')
-    # ending at end of year
     end_date = pd.to_datetime(f'{end_year}-{END_DATE}')
     
-    # declare empty set
+    # declare empty set for tickers
     all_tickers = set()
 
     # S&P change log before the start date 
@@ -209,6 +263,110 @@ def get_all_historical_tickers(df_changes: pd.DataFrame,
     return sorted(list(all_tickers))
 
 
+def fetch_edgar_fundamentals(ticker: str,
+                             start_year: int):
+    """
+    Queries SEC EDGAR Company Facts API using a global CIK map lookup
+    Uses multi-tag institutional taxonomy fallbacks.
+
+    Inputs:
+    ticker (str): stock ticker
+    start_year: first year to gather filing date
+    
+    Returns:
+        list: a list of dictionaries containing historical book value
+        and shares outstanding mapped by filing dates
+    """
+    records = []
+    try:
+        # stripping punctuations to match with global map
+        clean_target = ticker.replace('-', '').replace('.', '').upper()
+        # load CIK value from global map
+        cik = SEC_CIK_MAP.get(clean_target)
+        
+        if not cik:
+            # empty list
+            return records
+        
+        # extract point-in-time disclosure dictionary 
+        # contains complete structured XBRL corporate history
+        facts_url = f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json'
+        facts = requests.get(facts_url, headers = SEC_HEADERS, timeout = 10).json()
+        us_gaap = facts.get('facts', {}).get('us-gaap', {})
+        
+        # accounting taxonomy keys sourced from open-source SEC EDGAR documentation
+        # targets standard corporate, MLP, and trust balance sheet representation
+        equity_keys = [
+            'StockholdersEquity', 
+            'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest', 
+            'CommonStockSharesOutstandingWithAdditionalPaidInCapital',
+            'PartnersCapital'
+        ]
+        equity_units = None
+        
+        for k in equity_keys:
+            if k in us_gaap:
+                equity_units = us_gaap[k].get('units', {}).get('USD', [])
+                # break when USD unit is found for book value
+                if equity_units:
+                    break
+        
+        # cascade down alternative keys to capture varying accounting representations
+        # for shares outstanding
+        shares_keys = [
+            'CommonStockSharesOutstanding', 
+            'EntityCommonStockSharesOutstanding',
+            'WeightedAverageNumberOfSharesOutstandingBasic',
+            'CommonStockSharesIssued'
+            ]
+        shares_units = None
+        
+        for k in shares_keys:
+            if k in us_gaap:
+                shares_units = us_gaap[k].get('units', {}).get('shares', [])
+                # break loop when shares unit is found for number of shares
+                if shares_units:
+                    break
+        
+        if not equity_units or not shares_units:
+            # empty list
+            return records
+        
+        df_equity = pd.DataFrame(equity_units)
+        df_shares = pd.DataFrame(shares_units)
+        
+        # filter exclusively for audited 10-K records
+        # guarantees structural consistency and drops messy 10-Q noise
+        if 'form' in df_equity.columns:
+            df_equity = df_equity[df_equity['form'] == '10-K']
+            df_shares = df_shares[df_shares['form'] == '10-K']
+        
+        if df_equity.empty or df_shares.empty:
+            return records
+        
+        df_equity['fy_year'] = df_equity['fy'].astype(str)
+        df_shares['fy_year'] = df_shares['fy'].astype(str)
+
+        # merge disclosures on shared fiscal year metrics
+        merged = pd.merge(df_equity, df_shares, on = 'fy_year', suffixes = ('_eq', '_sh'))
+        # filter out filings since the prior year of analysis start date
+        merged = merged[merged['fy_year'].astype(float) >= (start_year - 1)]
+        
+        for _, row in merged.iterrows():
+            records.append({
+                'ticker': ticker,
+                'filing_date': pd.to_datetime(row['filed_eq']),
+                'book_value': float(row['val_eq']),
+                'shares_outstanding': float(row['val_sh'])
+                })
+            
+        
+    except Exception:
+        pass
+    return records
+
+
+
 #####################
 # 2. Data Caching
 #####################
@@ -217,8 +375,11 @@ def build_and_cache_data(start_year: int, end_year: int,
                          force_redownload: bool = False,
                          verbose = False):
     """
-    Constructs local parquet cache files for stock prices and fundamentals
-    by querying Yahoo Finance API. Throttled requests to not hit rate limits.
+    Constructs local parquet cache files for
+    - stock prices by querying Yahoo Finance API.
+    - fundamentals by querying SEC EDGAR Company Facts API
+    
+    Uses throttled requests to not hit rate limits.
 
     Inputs:
         start_year (int): Starting year for data downloads
@@ -228,11 +389,10 @@ def build_and_cache_data(start_year: int, end_year: int,
 
     Returns:
         None (saves data structures directly onto cache files)
-
     """
     # point-in-time S&P 500 index changes tracking log
     df_changes = get_point_in_time_universe_data()
-    # relevant stocks for the time window
+    # all relevant stocks for the time window
     all_tickers = get_all_historical_tickers(df_changes, start_year, end_year)
     
     start_str = f'{start_year}-{START_DATE}'
@@ -241,22 +401,26 @@ def build_and_cache_data(start_year: int, end_year: int,
     ## === Price caching ===
     if not PRICE_CACHE_PATH.exists() or force_redownload:
         if verbose:    
-            print(f'Downloading historical daily prices'
-                  f'for {len(all_tickers)} tickers...')
+            print('Downloading historical daily prices for '
+                  f'{len(all_tickers)} tickers...')
+        
         raw_prices = yf.download(all_tickers,
                                  start = start_str,
                                  end = end_str,
-                                 auto_adjust = True, progress = False
+                                 auto_adjust = True,
+                                 progress = False
                                  )['Close']
-        # drop tickers that are completely empty
+        # drop tickers that are completely empty and save to cache
         raw_prices = raw_prices.dropna(axis = 1, how = 'all')
         raw_prices.to_parquet(PRICE_CACHE_PATH)
         
     else:
         if verbose:
-            print('Price cache validated locally. Proceeding.')
+            print('Price cache validated locally. Proceeding.\n')
         raw_prices = pd.read_parquet(PRICE_CACHE_PATH)
     
+    # Extract tickers that actually have historical pricing data
+    # saves time on SEC queries - no point in querying stocks with no price data
     if isinstance(raw_prices.columns, pd.MultiIndex):
         active_price_tickers = list(raw_prices.columns.get_level_values(-1).unique())
     else:
@@ -264,8 +428,7 @@ def build_and_cache_data(start_year: int, end_year: int,
         
     if verbose:
         # for debugging
-        dropped_price_total = len(all_tickers) - len(active_price_tickers)
-        
+        dropped_price_total = len(all_tickers) - len(active_price_tickers) 
         print(f'Total tickers before pricing section: {len(all_tickers)}')
         print(f'Tickers dropped by yfinance (pricing): {dropped_price_total}')
     
@@ -276,58 +439,38 @@ def build_and_cache_data(start_year: int, end_year: int,
         
         fundamental_records = []
         
+        # replaced fundamentals API scraping from yfinance to EDGAR API 
         for i, ticker in enumerate(active_price_tickers):
-            if i % 20 == 0 and i > 0:
-                time.sleep(0.1)    # added delay to avoid rate limits
-            
-            try:
-                ticker_obj = yf.Ticker(ticker)
-                bs = ticker_obj.balance_sheet
+            # throttle requests to honor SEC compliance rate thresholds
+            if i % 10 == 0 and i > 0:
+                time.sleep(0.11)
                 
-                # variations of string names for equity and number of shares
-                equity_labels = ['Stockholders Equity',
-                                 'Total Stockholders Equity',
-                                 'Common Stock Equity']
-                shares_labels = ['Ordinary Shares Number',
-                                 'Shares Outstanding',
-                                 'Implied Shares Outstanding']
-                
-                equity_row = next((bs.loc[label] for label in equity_labels if label in bs.index), None)
-                shares_row = next((bs.loc[label] for label in shares_labels if label in bs.index), None)
-                
-                if equity_row is not None and shares_row is not None:
-                    for date_index in bs.columns:
-                        fundamental_records.append({
-                            'ticker': ticker,
-                            'filing_date': pd.to_datetime(date_index),
-                            'book_value': float(equity_row[date_index]),
-                            'shares_outstanding': float(shares_row[date_index])
-                            })
-                
-            except Exception as e:
-                if verbose:    
-                    print(f'Failed parsing fundamentals for {ticker}: {str(e)}')
-                continue
+            edgar_records = fetch_edgar_fundamentals(ticker, start_year)
+            if edgar_records:
+                # extend the records list
+                # fetch_edgar_fundamentals() returns a list of dictionary
+                fundamental_records.extend(edgar_records)
         
         df_fund = pd.DataFrame(fundamental_records)
         df_fund.to_parquet(FUNDAMENTALS_CACHE_PATH)
-        
+     
         if verbose:
             print('Fundamentals downloaded and stored to local Parquet cache.\n')
     
     else:
         if verbose:
-            print('Fundamentals cache validated locally. Proceeding.')
+            print('Fundamentals cache validated locally. Proceeding.\n')
             df_fund = pd.read_parquet(FUNDAMENTALS_CACHE_PATH)
     
     if verbose:
         successful_fundamental_tickers = set(df_fund['ticker'].unique())
         skipped_tickers = [t for t in active_price_tickers if t not in successful_fundamental_tickers]
         
-        print(f'Successfully parsed {len(successful_fundamental_tickers)} stocks')
+        print(f'Recovered historical metrics via SEC EDGAR for {len(successful_fundamental_tickers)} stocks')
         print(f'Skipped {len(skipped_tickers)} tickers (on fundamentals portion)')
 
     return None
+
 
 
 #####################
@@ -354,7 +497,7 @@ def run_fama_french(start_year: int,
             - mkt-rf
             - smb
             - hml
-            - rf_decomp
+            - rf_monthly
     """
     # load foundational data structures and cache
     df_changes = get_point_in_time_universe_data()    
@@ -423,6 +566,11 @@ def run_fama_french(start_year: int,
             # calculate market cap using active price and latest known share count
             market_cap = close_price * latest_filing['shares_outstanding']
             
+            # validating market cap before division
+            # was getting divide by zero errors in the check
+            if pd.isna(market_cap) or market_cap <= 0:
+                continue
+            
             # book-to-market ratio
             # high value -> value stocks, low value -> growth stocks
             bm_ratio = latest_filing['book_value'] / market_cap
@@ -431,7 +579,7 @@ def run_fama_french(start_year: int,
             forward_return = cum_month_returns.get(ticker, np.nan)
             
             # skip tickers with missing structural metrics to prevent NaNs
-            if pd.isna(forward_return) or pd.isna(bm_ratio) or market_cap <= 0:
+            if pd.isna(forward_return) or pd.isna(bm_ratio):
                 continue
             
             cross_section_data.append({
@@ -524,11 +672,12 @@ def run_fama_french(start_year: int,
 #####################
 # -1. Execution
 #####################
+
 if __name__ == '__main__':
     # testing for debugging
     build_and_cache_data(start_year = START_YEAR,
                      end_year = END_YEAR,
-                     force_redownload = True,
+                     force_redownload = False,
                      verbose = True)
     
     print('\nBuilding proxy factors for S&P 500...')
@@ -536,8 +685,9 @@ if __name__ == '__main__':
                                     end_year = END_YEAR)
     
     print('\n=== Replicated S&P 500 FF factor proxies ===')
-    print(ff_factors_df.to_string())
+    print(ff_factors_df.map('{:.3%}'.format).to_string())
     
     print('\n=== Correlation matrix ===')
     print(ff_factors_df[['mkt-rf', 'smb', 'hml']].corr())
+
     
