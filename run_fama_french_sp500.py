@@ -14,10 +14,17 @@ Fama-French factor replication on the S&P 500
         - implemented function for building and saving cache files
             - prices
             - book value data
-        - implemented evaluation of Fama-French factors
+        - implemented evaluation of proxy monthly Fama-French factors
             - by dividing the investable universe into 6 core portfolios
         - changed fundamentals data source from yfinance API to SEC EDGAR API
             - can extract data from further back unlike yfinance's 3-4 years only
+        - download official Fama-French factors
+    
+    Issues identified and fixed in this iteration:
+        - yfinance -> dropping last price (fixed)
+        - proxy factors were not generating first month
+            (as prices were being downloaded starting on Jan 1st
+             so first rebalance date was end of trading day January)
 
     Issues so far:
         dropping:
@@ -395,8 +402,18 @@ def build_and_cache_data(start_year: int, end_year: int,
     # all relevant stocks for the time window
     all_tickers = get_all_historical_tickers(df_changes, start_year, end_year)
     
-    start_str = f'{start_year}-{START_DATE}'
-    end_str = f'{end_year}-{END_DATE}'
+    # changed to one month prior to generate the January proxy factor
+    start_str = (
+        pd.Timestamp(f'{start_year}-{START_DATE}')
+        - pd.DateOffset(months = 1)
+        ).strftime('%Y-%m-%d')
+    
+    
+    # yfinance was treating end date as exclusive (dropping 12-31 previously)
+    end_str = (
+        pd.Timestamp(f'{end_year}-{END_DATE}')
+        + pd.Timedelta(days = 1)
+        ).strftime('%Y-%m-%d')
     
     ## === Price caching ===
     if not PRICE_CACHE_PATH.exists() or force_redownload:
@@ -474,11 +491,11 @@ def build_and_cache_data(start_year: int, end_year: int,
 
 
 #####################
-# 3. Fama-French factors
+# 3. Fama-French Proxy factors
 #####################
 
-def run_fama_french(start_year: int,
-                    end_year: int) -> pd.DataFrame:
+def compute_ff_proxy_factors(start_year: int,
+                             end_year: int) -> pd.DataFrame:
     """
     Executes the Fama-French 3-factor replication mechanism.
     
@@ -669,6 +686,61 @@ def run_fama_french(start_year: int,
     return pd.DataFrame(factor_results).set_index('month_end')
     
 
+
+#####################
+# 4. Fama-French Actual Factors
+#####################
+
+def fetch_official_ff_factors(start_year: int,
+                              end_year: int) -> pd.DataFrame:
+    
+    import zipfile
+    import io
+    
+    # official factors
+    url = 'https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip'
+    
+    # download and extract zip file
+    response = requests.get(url, timeout = 10)
+    with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+        csv_filename = z.namelist()[0]
+        with z.open(csv_filename) as f:
+            # skip the first 3 rows (info about CRSP and 1-month T bill)
+            df = pd.read_csv(f, skiprows = 3 )
+    
+    # rename 'Unnamed: 0' column to date
+    df = df.rename(columns = {df.columns[0]: 'date'})
+    
+    # drop rows with empty dates 
+    df = df.dropna(subset = ['date'])
+    # convert to string and strip any whitespace for length checks
+    df['date'] = df['date'].astype(str).str.strip()
+
+    # Isolate monthly rows (eliminate annual rows and copyright lines)
+        # Monthly rows have length 6 (e.g., '202401').
+        # Annual rows have length 4 (e.g., '2024').
+    df = df[ df['date'].str.len() == 6]
+    
+    # in case any header/notices passed str length == 6 test
+    # keeping only numeric values for dates
+    df = df[ df['date'].str.isnumeric() ]
+    
+    # parse YYYYMM strings into monthly PeriodIndex
+    df['date'] = (
+        pd.to_datetime(df['date'], format='%Y%m').dt.to_period('M')
+        )
+    df = df.set_index('date')
+    
+    # change the FF percentage values to decimals
+    df = df.astype(float) / 100.0
+    
+    # filter to the operational time window
+    start_dt = pd.Period(f"{start_year}-01", freq = 'M')
+    end_dt = pd.Period(f"{end_year}-12", freq = 'M')
+    
+    return df.loc[start_dt:end_dt]
+
+
 #####################
 # -1. Execution
 #####################
@@ -681,13 +753,16 @@ if __name__ == '__main__':
                      verbose = True)
     
     print('\nBuilding proxy factors for S&P 500...')
-    ff_factors_df = run_fama_french(start_year = START_YEAR,
-                                    end_year = END_YEAR)
+    ff_proxy_df = compute_ff_proxy_factors(start_year = START_YEAR,
+                                  end_year = END_YEAR)
     
-    print('\n=== Replicated S&P 500 FF factor proxies ===')
-    print(ff_factors_df.map('{:.3%}'.format).to_string())
+    print('\n=== Monthly-rebalanced S&P 500 FF factor proxies ===')
+    print(ff_proxy_df.head().map('{:.3%}'.format).to_string())
+    
+    ff_actual_df = fetch_official_ff_factors(start_year = START_YEAR,
+                                             end_year = END_YEAR)
     
     print('\n=== Correlation matrix ===')
-    print(ff_factors_df[['mkt-rf', 'smb', 'hml']].corr())
+    print(ff_proxy_df[['mkt-rf', 'smb', 'hml']].corr())
 
     
