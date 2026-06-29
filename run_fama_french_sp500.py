@@ -19,12 +19,7 @@ Fama-French factor replication on the S&P 500
         - changed fundamentals data source from yfinance API to SEC EDGAR API
             - can extract data from further back unlike yfinance's 3-4 years only
         - download official Fama-French factors
-    
-    Issues identified and fixed in this iteration:
-        - yfinance -> dropping last price (fixed)
-        - proxy factors were not generating first month
-            (as prices were being downloaded starting on Jan 1st
-             so first rebalance date was end of trading day January)
+
 
     Issues so far:
         dropping:
@@ -484,7 +479,7 @@ def build_and_cache_data(start_year: int, end_year: int,
         skipped_tickers = [t for t in active_price_tickers if t not in successful_fundamental_tickers]
         
         print(f'Recovered historical metrics via SEC EDGAR for {len(successful_fundamental_tickers)} stocks')
-        print(f'Skipped {len(skipped_tickers)} tickers (on fundamentals portion)')
+        print(f'Skipped tickers on fundamentals portion: {len(skipped_tickers)}')
 
     return None
 
@@ -497,7 +492,8 @@ def build_and_cache_data(start_year: int, end_year: int,
 def compute_ff_proxy_factors(start_year: int,
                              end_year: int) -> pd.DataFrame:
     """
-    Executes the Fama-French 3-factor replication mechanism.
+    Executes the Fama-French 3-factor replication mechanism
+    but with monthly rebalancing.
     
     Sorts the point-in-time investable universe into 2x3 value-weighted portfolios
     based on Size (Market Cap) and Value/Growth (Book-to-Market ratio).
@@ -693,7 +689,19 @@ def compute_ff_proxy_factors(start_year: int,
 
 def fetch_official_ff_factors(start_year: int,
                               end_year: int) -> pd.DataFrame:
+    """
+    Queries Kenneth French's online data library to extract historical Fama-French 3-factors
     
+    Drops annual metrics , skips admin notices/copyright descriptions,
+    and standardizes the operational dataset into a monthly PeriodIndex ('M')
+    
+    Inputs:
+        start_year (int): starting year for the factor extraction window
+        end_year (int): ending year for the factor extraction window
+
+    Returns
+        pd.DataFrame: Chronologically sorted DataFrame containing the official monthly FF factors
+    """
     import zipfile
     import io
     
@@ -742,27 +750,179 @@ def fetch_official_ff_factors(start_year: int,
 
 
 #####################
+# 5. Helper functions
+#####################
+
+def align_to_monthly_period(df1: pd.DataFrame | pd.Series,
+                            df2: pd.DataFrame | pd.Series,
+                            how: str = 'inner') -> pd.DataFrame:
+    """
+    Standardizes two DataFrames or Seriesto a monthly PeriodIndex ('M')
+    and merges them
+    Accepts daily or monthly timeseries, strips duplicate intermediate entries,
+    preserving only the ifnal known record per period, and joins on the combined index
+    
+    Input:
+        df1 (pd.DataFrame): first financial dataset for alignment
+        df2 (pd.DataFrame): second financial dataset for alignment
+        how (str): structural join style passed to Pandas (e.g., 'inner', 'outer', 'left')
+    
+    Returns:
+        pd.DataFrame -> a unified DataFrame indexed by a clean monthly PeriodIndex
+    """
+    # convert to DataFrame if Series, otherwise make a copy
+    d1 = df1.to_frame() if isinstance(df1, pd.Series) else df1.copy()
+    d2 = df2.to_frame() if isinstance(df2, pd.Series) else df2.copy()
+    
+    # standardize to monthly PeriodIndex
+    d1.index = pd.to_datetime(d1.index.astype(str)).to_period('M')
+    d2.index = pd.to_datetime(d2.index.astype(str)).to_period('M')
+    
+    # drop duplicate months if daily data was passed (by keeping last trading day)
+    d1 = d1.loc[~d1.index.duplicated(keep = 'last')]
+    d2 = d2.loc[~d2.index.duplicated(keep = 'last')]
+    
+    return d1.join(d2, how = how)
+
+
+
+def calculate_ols_metrics(Y: np.ndarray | pd.Series,
+                                 X: np.ndarray | pd.Series):
+    """
+    Computes ordinary least squares (OLS) regression diagnostics between
+    two aligned financial time series.
+    
+    Removes non-overlapping observations, estimates the closed-form regression
+    parameters, and reports goodness-of-fit and parameter uncertainty metrics.
+
+    Inputs:
+        Y (np.ndarray | pd.Series): dependent variable
+        X (np.ndarray | pd.Series): independent variable
+    
+    Returns:
+        dict:
+            correlation, beta, beta_se, alpha, alpha_se, r_squared, rse, observations
+
+    """
+    # check for raw empty inputs
+    if len(Y) == 0 or len(X) == 0:
+        raise ValueError('Input vectors Y and X must not be empty.')
+    
+    # align both input vectors into a localized DataFrame to eliminate mutual missing index
+    aligned_data = pd.DataFrame({'Y': Y, 'X': X}).dropna()
+    
+    Y_clean = aligned_data['Y'].values
+    X_clean = aligned_data['X'].values
+    
+    N = len(Y_clean)
+    
+    if N == 0:
+        raise ValueError('Vector alignment failed. Y and X have no overlapping indices.')
+    if N <= 2:
+        return {'error': 'Insufficient synchoronized observations to calculate regression metrics'}
+    
+    # stacking a column of ones with independent variable
+    # y_i = alpha + beta * x_i
+    # => Y = [1  X][alpha beta]
+    # Nx2 matrix
+    design_matrix = np.column_stack([np.ones(N), X_clean])
+    
+    # To compute closed-form OLS parameters
+    # [alpha beta] = [X^T * X)^(-1) * (X^T * Y)
+    XtX = design_matrix.T @ design_matrix
+    XtY = design_matrix.T @ Y_clean
+    
+    try:
+        # solved parameters 
+        beta_hat = np.linalg.inv(XtX) @ XtY
+    except np.linalg.LinAlgError:
+        return {'error': 'Matrix inversion failed. Check variable X for zero variance (constant values)'}
+    
+    alpha = beta_hat[0]
+    beta = beta_hat[1]
+    
+    # generate predicted values and extract residual tracking errors
+    Y_hat = design_matrix @ beta_hat
+    residuals = Y_clean - Y_hat
+    
+    # core sum of square metrics for variance division
+    ss_residual = np.sum(residuals ** 2)
+    ss_total = np.sum( (Y_clean - np.mean(Y_clean)) ** 2)
+    
+    # r^2 and baseline risk metrics
+    r_squared = 1.0 - (ss_residual / ss_total)
+    rse = np.sqrt(ss_residual / (N - 2))
+    
+    # Parameter Variance-Covariance matrix to extract parameter margins of error
+    # RSE^2 * (X^T * X)^(-1)
+    var_cov_matrix = (rse ** 2) * np.linalg.inv(XtX)
+    
+    alpha_se = np.sqrt(var_cov_matrix[0,0])
+    beta_se = np.sqrt(var_cov_matrix[1, 1])
+    
+    correlation = np.corrcoef(X_clean, Y_clean)[0, 1]
+    
+    return {
+        'correlation': correlation,
+        'beta': beta,
+        'beta_se': beta_se,
+        'alpha': alpha,
+        'alpha_se': alpha_se,
+        'r_squared': r_squared,
+        'rse': rse,
+        'observations': N
+        }
+
+
+#####################
 # -1. Execution
 #####################
 
 if __name__ == '__main__':
-    # testing for debugging
+    print('='*61)
+    print('Custom Fama-French 3-factor Replication')
+    print('Universe: Point-in-Time S&P 500 | Monthly Rebalancing')
+    print('='*61)
+    
+    print('\nPreparing local data cache...')
     build_and_cache_data(start_year = START_YEAR,
-                     end_year = END_YEAR,
-                     force_redownload = False,
-                     verbose = True)
+                         end_year = END_YEAR,
+                         verbose = True)
     
-    print('\nBuilding proxy factors for S&P 500...')
-    ff_proxy_df = compute_ff_proxy_factors(start_year = START_YEAR,
-                                  end_year = END_YEAR)
+    print('\nComputing proxy Fama-French factors...')
+    proxy = compute_ff_proxy_factors(start_year = START_YEAR,
+                                     end_year = END_YEAR)
+    print('\nDownloading official Fama-French factors...')
+    official = fetch_official_ff_factors(start_year = START_YEAR,
+                                         end_year = END_YEAR)
     
-    print('\n=== Monthly-rebalanced S&P 500 FF factor proxies ===')
-    print(ff_proxy_df.head().map('{:.3%}'.format).to_string())
+    print('Aligning monthly factor series...')
+    factors = align_to_monthly_period(proxy, official)
+    print(f'Aligned factor observations: {len(factors)} months')
     
-    ff_actual_df = fetch_official_ff_factors(start_year = START_YEAR,
-                                             end_year = END_YEAR)
+    print('\n' + '-'*50)
+    print('Custom Factor Replication Results')
+    print('-'*50)
     
-    print('\n=== Correlation matrix ===')
-    print(ff_proxy_df[['mkt-rf', 'smb', 'hml']].corr())
-
+    comparisons = [
+        ('Market Excess Return', 'mkt-rf', 'Mkt-RF'),
+        ('SMB', 'smb', 'SMB'),
+        ('HML', 'hml', 'HML'),
+        ]
     
+    for name, proxy_col, official_col in comparisons:
+        results = calculate_ols_metrics(
+            Y = factors[proxy_col],
+            X = factors[official_col]
+            )
+        
+        print(f'\n{name}')
+        print('-'*33)
+        print(f'Correlation : {results["correlation"]:.4f}')
+        print(f'R²          : {results["r_squared"]:.2%}')
+        print(f'Beta        : {results["beta"]:.3f} ± {results["beta_se"]:.3f}')
+        print(f'Alpha       : {results["alpha"]:.3%} ± {results["alpha_se"]:.3%}')
+        print(f'RSE         : {results["rse"]:.2%}')
+        print(f'Observations: {results["observations"]}')
+        
+    print('\nProgram Terminated')
