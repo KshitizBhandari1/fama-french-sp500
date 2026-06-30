@@ -19,9 +19,12 @@ Fama-French factor replication on the S&P 500
         - changed fundamentals data source from yfinance API to SEC EDGAR API
             - can extract data from further back unlike yfinance's 3-4 years only
         - download official Fama-French factors
+        - regressed proxy factors against the actual Fama-French factors
+        - added plots showing performance, OLS regression fit, rolling correlation
+            of proxy factors vs FF3 official factors
 
 
-    Issues so far:
+    Issues:
         dropping:
             139-140 tickers on prices (delisted/acquired)
             77 on fundamental section
@@ -31,10 +34,6 @@ Fama-French factor replication on the S&P 500
             -> still failed
         -> cannot find an open source database yet
             -> hence survivorship bias seems unavoidable without paid databases
-    
-    Things to do next:
-        - regress proxy factors against the actual Fama-French factors
-            Perfect correlation is not expected as S&P 500 is inherently a large-cap universe
         
 """
 
@@ -45,6 +44,8 @@ import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from pathlib import Path
 
 
@@ -72,7 +73,9 @@ while not (PROJECT_ROOT / 'data').exists():
 
 DATA_DIR = PROJECT_ROOT / 'data'
 CACHE_DIR = PROJECT_ROOT / 'factor-cache'
+PLOTS_DIR = PROJECT_ROOT / 'plots'
 os.makedirs(CACHE_DIR, exist_ok = True)
+os.makedirs(PLOTS_DIR, exist_ok = True)
 
 START_YEAR = 2015
 START_DATE = '01-01'
@@ -787,21 +790,28 @@ def align_to_monthly_period(df1: pd.DataFrame | pd.Series,
 
 
 def calculate_ols_metrics(Y: np.ndarray | pd.Series,
-                                 X: np.ndarray | pd.Series):
+                          X: np.ndarray | pd.Series):
     """
     Computes ordinary least squares (OLS) regression diagnostics between
-    two aligned financial time series.
+    two aligned financial time series via explicit matrix inversion.
     
-    Removes non-overlapping observations, estimates the closed-form regression
-    parameters, and reports goodness-of-fit and parameter uncertainty metrics.
+    Eliminates non-overlapping observation intervals, models the tracking framework
+    Y = alpha + beta * X + epsilon, and evaluates statistical parameter boundaries.
 
     Inputs:
-        Y (np.ndarray | pd.Series): dependent variable
-        X (np.ndarray | pd.Series): independent variable
+        Y (np.ndarray | pd.Series): dependent variable (e.g., proxy factor returns)
+        X (np.ndarray | pd.Series): independent variable (e.g., benchmark factor returns)
     
     Returns:
-        dict:
-            correlation, beta, beta_se, alpha, alpha_se, r_squared, rse, observations
+        dict: Diagnostic parameters containing:
+            - 'correlation' (float): Pearson correlation coefficient
+            - 'beta' (float): Estimated factor loading coefficient
+            - 'beta_se' (float): Standard error of the beta coefficient
+            - 'alpha' (float): Estimated intercept (idiosyncratic return)
+            - 'alpha_se' (float): Standard error of the alpha coefficient
+            - 'r_squared' (float): Coefficient of determination (goodness-of-fit)
+            - 'rse' (float): Residual Standard Error of the regression
+            - 'observations' (int): Total overlapping sample count (N)
 
     """
     # check for raw empty inputs
@@ -828,6 +838,7 @@ def calculate_ols_metrics(Y: np.ndarray | pd.Series,
     design_matrix = np.column_stack([np.ones(N), X_clean])
     
     # To compute closed-form OLS parameters
+    # set derivative with respect to beta = 0 (minimization) for e^T e 
     # [alpha beta] = [X^T * X)^(-1) * (X^T * Y)
     XtX = design_matrix.T @ design_matrix
     XtY = design_matrix.T @ Y_clean
@@ -873,6 +884,133 @@ def calculate_ols_metrics(Y: np.ndarray | pd.Series,
         'observations': N
         }
 
+
+#####################
+# 6. Visualization
+#####################
+    
+def plot_factor_replication_summary(aligned_factors: pd.DataFrame):
+    """
+    Generates a professional 3-panel visual diagnostic dashboard using
+    the pre-aligned operational factor dataset and custom OLS parameters.
+    
+    Input: aligned factors (output of align_to_monthly_period() function)
+    """
+    # convert the already-aligned PeriodIndex to timestamps
+    df_plot = aligned_factors.copy()
+    if isinstance(df_plot.index, pd.PeriodIndex):
+        df_plot.index = df_plot.index.to_timestamp(how='end')
+    else:
+        df_plot.index = pd.to_datetime(df_plot.index)
+    
+    # map column pairs (Proxy Column, Official Column, Descriptive Title)
+    factor_mapping = [
+        ('mkt-rf', 'Mkt-RF', 'Market Excess Return (Mkt-RF)'),
+        ('smb', 'SMB', 'Size Premium (SMB)'),
+        ('hml', 'HML', 'Value Premium (HML)')
+    ]
+    
+    plt.style.use('ggplot')
+    # clear out the gray panel background and the outer figure borders
+    plt.rcParams['axes.facecolor'] = 'white'      # Interior plot background to white
+    plt.rcParams['axes.edgecolor'] = '#cbcbcb'    # Light gray bounding box around axes
+    plt.rcParams['figure.facecolor'] = 'white'    # Exterior canvas background to white
+    
+    # 3x3 plots -> wider for wealth timeseries to observe path in detail
+    fig, axes = plt.subplots(3, 3, figsize=(18, 14), gridspec_kw={'width_ratios': [2, 1, 1.2]})
+    fig.suptitle('Fama-French 3-Factor Replication Diagnostics'
+                 '\nUniverse: S&P 500 PIT vs. Official CRSP Benchmark', 
+                 fontsize=16, fontweight='bold', y=0.98)
+    
+    # p_col -> proxy column, o_col -> official column, title -> actual title
+    for i, (p_col, o_col, title) in enumerate(factor_mapping):
+        p_series = df_plot[p_col]
+        o_series = df_plot[o_col]
+        
+        # --- COLUMN 1: Cumulative Growth of $1 ---
+        # cumulative return column: ith row, first column (0)
+        ax_cum = axes[i, 0]
+        cum_proxy = (1 + p_series).cumprod()
+        cum_official = (1 + o_series).cumprod()
+        
+        ax_cum.plot(cum_proxy.index, cum_proxy,
+                    label = 'Proxy (S&P 500)',
+                    color = '#1f77b4', linewidth = 2)
+        ax_cum.plot(cum_official.index, cum_official,
+                    label = 'Official (FF)',
+                    color = '#ff7f0e', linestyle = '--', linewidth = 1.8)
+        
+        ax_cum.set_title(f'Cumulative Growth of $1: {title}',
+                         fontsize=11, fontweight='bold')
+        ax_cum.set_ylabel('Portfolio Value ($)')
+        
+        if i == 0:
+            ax_cum.legend(loc='upper left', frameon=True)
+            
+        # --- COLUMN 2: OLS Scatter & Custom Regression Line ---
+        # regression column: ith row, second column (1)
+        ax_reg = axes[i, 1]
+        ax_reg.scatter(o_series, p_series, alpha = 0.5,
+                       color='#2ca02c', edgecolors = 'none', s = 25)
+        
+        # regression using custom function
+        metrics = calculate_ols_metrics(Y = p_series, X = o_series)
+        # parameter values
+        alpha_val = metrics['alpha']
+        beta_val = metrics['beta']
+        
+        # trendline coordinates using extracted parameters (y = alpha + beta * x)
+        x_vals = np.array([o_series.min(), o_series.max()])
+        y_vals = alpha_val + beta_val * x_vals  
+        
+        ax_reg.plot(x_vals, y_vals,
+                    color = 'red', linestyle = '-', linewidth = 1.5, 
+                    label = f'$\\beta$: {beta_val:.2f}\n$\\alpha$: {alpha_val:.2%}')
+        ax_reg.axhline(0, color='black', linewidth=0.5, linestyle=':')
+        ax_reg.axvline(0, color='black', linewidth=0.5, linestyle=':')
+        ax_reg.set_title(f'OLS Fit: {o_col}', fontsize=11, fontweight='bold')
+        ax_reg.set_xlabel('Official Factor Returns')
+        ax_reg.set_ylabel('Proxy Factor Returns')
+        ax_reg.legend(loc = 'lower right', frameon = True, handlelength = 0)
+
+        # --- COLUMN 3: Rolling 12-Month Correlation ---
+        # rolling correlation column: ith row, third column (2)
+        ax_corr = axes[i, 2]
+        rolling_corr = p_series.rolling(window = 12).corr(o_series)
+        
+        ax_corr.plot(rolling_corr.index, rolling_corr,
+                     color = '#9467bd', linewidth = 1.5)
+        # average rolling correlation marked as horizontal line
+        ax_corr.axhline(rolling_corr.mean(), color = 'red', linestyle = ':',
+                        label = f'Mean: {rolling_corr.mean():.2f}')
+        ax_corr.set_title(f'Rolling 12M Correlation: {o_col}',
+                          fontsize = 11, fontweight = 'bold')
+        ax_corr.set_ylim(-0.2, 1.05)
+        ax_corr.set_ylabel('Correlation Coefficient')
+        ax_corr.legend(loc='lower left', frameon = True)
+
+    # format timeline axes ticks uniformly - to prevent date crowding
+    for ax in axes[:, 0].flatten():
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        ax.xaxis.set_major_locator(mdates.YearLocator(2))
+        
+    for ax in axes[:, 2].flatten():
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        ax.xaxis.set_major_locator(mdates.YearLocator(2))
+
+    plt.tight_layout()
+    
+    # Save output image alongside your local cache directory structure
+    try:
+        output_path = PLOTS_DIR / 'factor_replication_diagnostics.png'
+        plt.savefig(output_path, dpi = 300, bbox_inches = 'tight')
+        print(f"\n[Success] Integrated OLS dashboard saved to: {output_path.resolve()}")
+    except NameError:
+        # Fallback if PLOTS_DIR path doesn't work
+        plt.savefig('factor_replication_diagnostics.png', dpi = 300, bbox_inches = 'tight')
+        print("\n[Success] Integrated OLS dashboard saved to working directory.")
+        
+    plt.show()
 
 #####################
 # -1. Execution
@@ -924,5 +1062,8 @@ if __name__ == '__main__':
         print(f'Alpha       : {results["alpha"]:.3%} ± {results["alpha_se"]:.3%}')
         print(f'RSE         : {results["rse"]:.2%}')
         print(f'Observations: {results["observations"]}')
+        
+    print('\nGenerating visual factor diagnostic dashboards...')
+    plot_factor_replication_summary(aligned_factors = factors)
         
     print('\nProgram Terminated')
