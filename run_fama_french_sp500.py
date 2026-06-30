@@ -5,36 +5,48 @@ Created on Mon Jun 22 08:13:36 2026
 
 @author: kshitizbhandari
 
-Fama-French factor replication on the S&P 500
-    Done so far:
-        - established global setup
-        - implemented data pipeline for:
-            - DGS1MO
-            - point-in-time S&P tickers
-        - implemented function for building and saving cache files
-            - prices
-            - book value data
-        - implemented evaluation of proxy monthly Fama-French factors
-            - by dividing the investable universe into 6 core portfolios
-        - changed fundamentals data source from yfinance API to SEC EDGAR API
-            - can extract data from further back unlike yfinance's 3-4 years only
-        - download official Fama-French factors
-        - regressed proxy factors against the actual Fama-French factors
-        - added plots showing performance, OLS regression fit, rolling correlation
-            of proxy factors vs FF3 official factors
+Fama-French 3-Factor Replication
+Point-in-Time S&P 500 Universe
 
+==================
+Framework
+==================
 
-    Issues:
-        dropping:
-            139-140 tickers on prices (delisted/acquired)
-            77 on fundamental section
-            - introduces survivorship bias
-            
-        -> tried using alternative datasets (like stooq) for delisted tickers
-            -> still failed
-        -> cannot find an open source database yet
-            -> hence survivorship bias seems unavoidable without paid databases
-        
+    Constructs empirical monthly-rebalanced proxy Fama-French factors
+    using a point-in-time S&P 500 universe.
+    
+    The objective is to evaluate how closely an index-constrained,
+    large-cap implementation tracks the official Fama-French factors.
+
+==================
+Pipeline:
+================== 
+
+    - Downloads historical S&P 500 constituent changes.
+    - Retrieves adjusted daily prices from Yahoo Finance.
+    - Retrieves book value of equity and shares outstanding from SEC EDGAR.
+    - Builds local Parquet caches.
+    - Forms six value-weighted portfolios using 2x3 Size-Book-to-Market sorts.
+    - Computes proxy Mkt-RF, SMB, and HML factors.
+    - Compares proxy factors with the official Ken French Data Library.
+    - Evaluates tracking performance using closed-form OLS regression.
+    - Produces cumulative return, regression, and rolling-correlation diagnostics.
+    
+==================
+Known Limitations
+==================
+ 
+   - Open-source pricing sources do not provide complete coverage of
+     historical delisted securities, introducing survivorship bias.
+        Exact numbers:
+            Total Tickers in the S&P 500 (2015-2025)        : 754
+            Tickers unavailable in price data (yfinance)    : 139
+            Tickers unavailable on fundamentals (SEC EDGAR) :  77
+    - Portfolio formation is performed monthly rather than annually.
+      Accordingly, this project should be interpreted as a proxy
+      implementation rather than an exact replication of the original
+      Fama-French methodology.
+      
 """
 
 import os
@@ -104,15 +116,16 @@ def download_sec_cik_map() -> dict:
         url = 'https://www.sec.gov/files/company_tickers.json'
         res = requests.get(url, headers = SEC_HEADERS, timeout = 10).json()
         
-        # clean both sides of comparision to capture dual-class variations
-        # (BRK-B, AMH-PG, etc.) removing hypthens and dots
+        # clean both sides of comparison to capture dual-class variations
+        # (BRK-B, AMH-PG, etc.) removing hyphens and periods
         return {
             row['ticker'].replace('-', '').replace('.','').upper():
-                str(row['cik_str']).zfill(10) # enforce 10 character string to be compatible with SEC
+                # enforce 10 character string to be compatible with SEC
+                str(row['cik_str']).zfill(10) 
                 for row in res.values()
                 }
     except Exception as e:
-        print(f'Warning: Failed to compile global SEC CIK map: {e}')
+        print(f'Warning: Failed to build global SEC CIK map: {e}')
         return {}
 
 # save the compiled dictionary once globally (reducing run-time)
@@ -134,7 +147,7 @@ def load_dgs1mo_data(csv_path = DGS1MO_PATH):
         csv_path (str or Path): Local system path to the FRED csv download.
     
     Returns:
-        pd.Series - Chronologically sorted daily risk-free rates index-mapped by
+        pd.Series - Chronologically sorted daily risk-free rates indexed by
         date
     """
     csv_path = Path(csv_path)
@@ -189,7 +202,7 @@ def get_point_in_time_universe_data() -> pd.DataFrame:
         df_changes = pd.read_csv(url, parse_dates = ['date'])
         df_changes.to_parquet(UNIVERSE_CACHE_PATH, index = False)
     except Exception:
-        # localized recovery fallback if remote source is removed/moved
+        # Fallback to the locally cached file if the remote source is unavailable
         df_changes = pd.read_parquet(UNIVERSE_CACHE_PATH)
     
     return df_changes.sort_values('date')
@@ -202,7 +215,7 @@ def get_constituents_on_date(target_date: pd.Timestamp,
     historical trading date.
     
     Inputs:
-        target_date (pd.TimeStamp): historical day for query
+        target_date (pd.TimeStamp): historical day to query
         df_changes (pd.DataFrame): point-in-time historical adjustment log
         
     Returns:
@@ -245,7 +258,7 @@ def get_all_historical_tickers(df_changes: pd.DataFrame,
     start_date = pd.to_datetime(f'{start_year}-{START_DATE}')
     end_date = pd.to_datetime(f'{end_year}-{END_DATE}')
     
-    # declare empty set for tickers
+    # Initialize empty set for tickers
     all_tickers = set()
 
     # S&P change log before the start date 
@@ -272,7 +285,7 @@ def fetch_edgar_fundamentals(ticker: str,
                              start_year: int):
     """
     Queries SEC EDGAR Company Facts API using a global CIK map lookup
-    Uses multi-tag institutional taxonomy fallbacks.
+    Uses multiple XBRL taxonomy fallbacks.
 
     Inputs:
     ticker (str): stock ticker
@@ -293,7 +306,7 @@ def fetch_edgar_fundamentals(ticker: str,
             # empty list
             return records
         
-        # extract point-in-time disclosure dictionary 
+        # extract point-in-time company facts data
         # contains complete structured XBRL corporate history
         facts_url = f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json'
         facts = requests.get(facts_url, headers = SEC_HEADERS, timeout = 10).json()
@@ -316,8 +329,8 @@ def fetch_edgar_fundamentals(ticker: str,
                 if equity_units:
                     break
         
-        # cascade down alternative keys to capture varying accounting representations
-        # for shares outstanding
+        # Iterate through alternative taxonomy keys to capture
+        # varying accounting representations for shares outstanding
         shares_keys = [
             'CommonStockSharesOutstanding', 
             'EntityCommonStockSharesOutstanding',
@@ -501,7 +514,7 @@ def compute_ff_proxy_factors(start_year: int,
     Sorts the point-in-time investable universe into 2x3 value-weighted portfolios
     based on Size (Market Cap) and Value/Growth (Book-to-Market ratio).
     
-    Evaluates monthly factor returns (Mkt-RF, SMB, HML) using monthly rebalancing.
+    Computes monthly factor returns (Mkt-RF, SMB, HML) using monthly rebalancing.
     
     Inputs:
         start_year (int): starting year for the factor analysis window
@@ -559,7 +572,7 @@ def compute_ff_proxy_factors(start_year: int,
         
         cross_section_data = []
         
-        # construct fundamental financial metrics for all valid assets on the cross-sectional line
+        # construct cross-sectional firm characteristics
         for ticker in valid_tickers:
             # closing price on rebalancing day to calculate size and ratios
             close_price = price_matrix.loc[rebalance_date, ticker]
@@ -582,7 +595,7 @@ def compute_ff_proxy_factors(start_year: int,
             # calculate market cap using active price and latest known share count
             market_cap = close_price * latest_filing['shares_outstanding']
             
-            # validating market cap before division
+            # validate market capitalization before division
             # was getting divide by zero errors in the check
             if pd.isna(market_cap) or market_cap <= 0:
                 continue
@@ -629,7 +642,8 @@ def compute_ff_proxy_factors(start_year: int,
         neutral_mask = (df_cs['bm_ratio'] > bm_30) & (df_cs['bm_ratio'] < bm_70)
         value_mask = df_cs['bm_ratio'] >= bm_70
         
-        # generate the 6 intersection portfolios (like Small-Growth, Big Growth, etc.)
+        # construct the 6 Size-Book-to-Market portfolios
+        # (like Small-Growth, Big Growth, etc.)
         portfolios = {
             'SG': df_cs[small_mask & growth_mask],
             'SN': df_cs[small_mask & neutral_mask],
@@ -639,7 +653,7 @@ def compute_ff_proxy_factors(start_year: int,
             'BV': df_cs[big_mask & value_mask]
             }
         
-        # calculate value-weighted returns for each of 6 core portfolois
+        # calculate value-weighted returns for each of the six portfolios
         portfolio_returns = {}
         for name, port_df in portfolios.items():
             if port_df.empty:
@@ -647,7 +661,7 @@ def compute_ff_proxy_factors(start_year: int,
                 continue
             # market cap weights within this specific sub-portfolio
             weights = port_df['market_cap'] / port_df['market_cap'].sum()
-            # dot product of weights and forward monthly returns
+            # value-weighted portfolio return
             portfolio_returns[name] = np.dot(port_df['forward_return'], weights)
         
         # === Factor equations ===
@@ -666,7 +680,7 @@ def compute_ff_proxy_factors(start_year: int,
         market_weights = df_cs['market_cap'] / total_market_cap
         market_raw_return = np.dot(df_cs['forward_return'], market_weights)
         
-        # extract daily risk-free rates recorved over monthly investment horizon
+        # extract daily risk-free rates recorded over monthly investment horizon
         rf_slice = rf_series.loc[rebalance_date:next_month_end]
         # the 1-month risk-free rate -> used to subtract from market return to get the market risk premium factor
         rf_monthly = 0.0 if rf_slice.empty else float((1 + rf_slice).prod() - 1)
@@ -693,16 +707,16 @@ def compute_ff_proxy_factors(start_year: int,
 def fetch_official_ff_factors(start_year: int,
                               end_year: int) -> pd.DataFrame:
     """
-    Queries Kenneth French's online data library to extract historical Fama-French 3-factors
+    Downloads the official Fama-French Research Factors dataset.
     
-    Drops annual metrics , skips admin notices/copyright descriptions,
+    Drops annual observations, removes nonmonthly rows and metadata lines from dataset,
     and standardizes the operational dataset into a monthly PeriodIndex ('M')
     
     Inputs:
         start_year (int): starting year for the factor extraction window
         end_year (int): ending year for the factor extraction window
 
-    Returns
+    Returns:
         pd.DataFrame: Chronologically sorted DataFrame containing the official monthly FF factors
     """
     import zipfile
@@ -760,10 +774,11 @@ def align_to_monthly_period(df1: pd.DataFrame | pd.Series,
                             df2: pd.DataFrame | pd.Series,
                             how: str = 'inner') -> pd.DataFrame:
     """
-    Standardizes two DataFrames or Seriesto a monthly PeriodIndex ('M')
+    Standardizes two DataFrames or Series to a monthly PeriodIndex ('M')
     and merges them
-    Accepts daily or monthly timeseries, strips duplicate intermediate entries,
-    preserving only the ifnal known record per period, and joins on the combined index
+    Accepts daily or monthly time series, strips duplicate intermediate entries,
+    preserving only the last observation within each month, and
+    joins on the combined index
     
     Input:
         df1 (pd.DataFrame): first financial dataset for alignment
@@ -793,10 +808,11 @@ def calculate_ols_metrics(Y: np.ndarray | pd.Series,
                           X: np.ndarray | pd.Series):
     """
     Computes ordinary least squares (OLS) regression diagnostics between
-    two aligned financial time series via explicit matrix inversion.
+    two aligned financial time series via closed-form matrix solution.
     
-    Eliminates non-overlapping observation intervals, models the tracking framework
-    Y = alpha + beta * X + epsilon, and evaluates statistical parameter boundaries.
+    Eliminates non-overlapping observation intervals, fits the linear model
+            Y = alpha + beta * X + epsilon, and 
+    estimates statistical parameters and associated uncertainty.
 
     Inputs:
         Y (np.ndarray | pd.Series): dependent variable (e.g., proxy factor returns)
@@ -829,7 +845,7 @@ def calculate_ols_metrics(Y: np.ndarray | pd.Series,
     if N == 0:
         raise ValueError('Vector alignment failed. Y and X have no overlapping indices.')
     if N <= 2:
-        return {'error': 'Insufficient synchoronized observations to calculate regression metrics'}
+        return {'error': 'Insufficient synchronized observations to calculate regression metrics'}
     
     # stacking a column of ones with independent variable
     # y_i = alpha + beta * x_i
@@ -838,7 +854,8 @@ def calculate_ols_metrics(Y: np.ndarray | pd.Series,
     design_matrix = np.column_stack([np.ones(N), X_clean])
     
     # To compute closed-form OLS parameters
-    # set derivative with respect to beta = 0 (minimization) for e^T e 
+        # closed-form OLS solution calculated by:
+            # setting derivative with respect to beta = 0 (minimization for e^T e)
     # [alpha beta] = [X^T * X)^(-1) * (X^T * Y)
     XtX = design_matrix.T @ design_matrix
     XtY = design_matrix.T @ Y_clean
@@ -891,10 +908,21 @@ def calculate_ols_metrics(Y: np.ndarray | pd.Series,
     
 def plot_factor_replication_summary(aligned_factors: pd.DataFrame):
     """
-    Generates a professional 3-panel visual diagnostic dashboard using
-    the pre-aligned operational factor dataset and custom OLS parameters.
+    Generates a 3-panel visual diagnostic dashboard comparing
+    the empirical S&P 500 proxy factors against the official FF3 benchmarks.
     
-    Input: aligned factors (output of align_to_monthly_period() function)
+    Construct:
+        cumulative return trajectories for cumulative wealth growth ($1 initial),
+        OLS scatter plots with exact trendline projections, and
+        rolling 12-month correlation paths to evaluate structural stability.
+    
+    Input:
+        aligned_factors (pd.DataFrame): Combined time series indexed monthly
+        PeriodIndex ('M') containing matched proxy and benchmark factor streams.
+        -> output from align_to_monthly_period() function.
+    
+    Returns:
+        None (Saves a 300-DPI diagnostic layout to PLOTS_DIR)
     """
     # convert the already-aligned PeriodIndex to timestamps
     df_plot = aligned_factors.copy()
@@ -911,18 +939,18 @@ def plot_factor_replication_summary(aligned_factors: pd.DataFrame):
     ]
     
     plt.style.use('ggplot')
-    # clear out the gray panel background and the outer figure borders
+    # Set figure and axes backgrounds to white
     plt.rcParams['axes.facecolor'] = 'white'      # Interior plot background to white
     plt.rcParams['axes.edgecolor'] = '#cbcbcb'    # Light gray bounding box around axes
     plt.rcParams['figure.facecolor'] = 'white'    # Exterior canvas background to white
     
-    # 3x3 plots -> wider for wealth timeseries to observe path in detail
+    # 3x3 plots -> allocate additional width to cumulative return plots
     fig, axes = plt.subplots(3, 3, figsize=(18, 14), gridspec_kw={'width_ratios': [2, 1, 1.2]})
     fig.suptitle('Fama-French 3-Factor Replication Diagnostics'
                  '\nUniverse: S&P 500 PIT vs. Official CRSP Benchmark', 
                  fontsize=16, fontweight='bold', y=0.98)
     
-    # p_col -> proxy column, o_col -> official column, title -> actual title
+    # p_col -> proxy column, o_col -> official column, title -> display title
     for i, (p_col, o_col, title) in enumerate(factor_mapping):
         p_series = df_plot[p_col]
         o_series = df_plot[o_col]
@@ -955,11 +983,12 @@ def plot_factor_replication_summary(aligned_factors: pd.DataFrame):
         
         # regression using custom function
         metrics = calculate_ols_metrics(Y = p_series, X = o_series)
-        # parameter values
+        # estimated regression coefficients
         alpha_val = metrics['alpha']
         beta_val = metrics['beta']
         
-        # trendline coordinates using extracted parameters (y = alpha + beta * x)
+        # Regression line coordinates using extracted parameters
+        # (y = alpha + beta * x)
         x_vals = np.array([o_series.min(), o_series.max()])
         y_vals = alpha_val + beta_val * x_vals  
         
